@@ -1,7 +1,22 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, Copy, X as XIcon } from "lucide-react";
+import { Check, ChevronDown, Copy, Download, X as XIcon } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  useSortable,
+  horizontalListSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -52,6 +67,52 @@ type ReferenceImage = {
   id: string;
   previewUrl: string;
 };
+
+function SortableReferenceThumb({
+  refImage,
+  onRemove,
+}: {
+  refImage: ReferenceImage;
+  onRemove: (id: string) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: refImage.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : undefined,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className="relative h-16 w-16 overflow-hidden rounded-lg bg-white/5"
+      {...attributes}
+      {...listeners}
+    >
+      <img
+        src={refImage.previewUrl}
+        alt="Reference image"
+        className="pointer-events-none h-full w-full object-cover"
+      />
+      <button
+        type="button"
+        aria-label="Remove reference image"
+        className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white hover:bg-black/70"
+        onClick={(e) => {
+          e.stopPropagation();
+          onRemove(refImage.id);
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <XIcon size={14} />
+      </button>
+    </div>
+  );
+}
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -146,6 +207,31 @@ function sortImagesNewestFirst(items: GeneratedImage[]): GeneratedImage[] {
     const bTs = b.created_at ? Date.parse(b.created_at) : Number.POSITIVE_INFINITY;
     return bTs - aTs;
   });
+}
+
+function getDownloadFileName(img: GeneratedImage): string {
+  const source = img.public_url.trim();
+  const fromUrl = (() => {
+    try {
+      const { pathname } = new URL(source);
+      const fileName = pathname.split("/").filter(Boolean).pop();
+      return fileName ?? "";
+    } catch {
+      return "";
+    }
+  })();
+
+  if (fromUrl) return fromUrl;
+
+  const ext = source.startsWith("data:image/webp")
+    ? "webp"
+    : source.startsWith("data:image/png")
+      ? "png"
+      : source.startsWith("data:image/jpeg")
+        ? "jpg"
+        : "png";
+
+  return `nano-banana-${img.id}.${ext}`;
 }
 
 const aspectRatioOptions = [
@@ -404,6 +490,9 @@ export default function Home() {
   const [copiedGalleryId, setCopiedGalleryId] = useState<string | null>(null);
   const [selectedImage, setSelectedImage] = useState<GeneratedImage | null>(null);
   const [islandDraftHydrated, setIslandDraftHydrated] = useState(false);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+  );
   const isGenerating = pendingGenerations.length > 0;
   const totalSpentUsd = images.reduce(
     (sum, img) => sum + (img.estimated_cost_usd ?? 0),
@@ -889,6 +978,36 @@ export default function Home() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (over && active.id !== over.id) {
+      setReferences((prev) => {
+        const oldIndex = prev.findIndex((r) => r.id === active.id);
+        const newIndex = prev.findIndex((r) => r.id === over.id);
+        return arrayMove(prev, oldIndex, newIndex);
+      });
+    }
+  };
+
+  const downloadImage = async (img: GeneratedImage) => {
+    try {
+      const response = await fetch(img.public_url, { mode: "cors" });
+      if (!response.ok) throw new Error("Failed to download image");
+
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = getDownloadFileName(img);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch {
+      window.open(img.public_url, "_blank", "noopener,noreferrer");
+    }
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -931,6 +1050,21 @@ export default function Home() {
           background-size: 200% 100%;
           animation: nano-banana-gallery-shimmer 1.5s infinite;
         }
+        @keyframes nano-banana-skeleton-breathe {
+          0%,
+          100% {
+            opacity: 0.78;
+            transform: scale(1);
+          }
+          50% {
+            opacity: 1;
+            transform: scale(1.01);
+          }
+        }
+        .nano-banana-gallery-skeleton-card {
+          animation: nano-banana-skeleton-breathe 1.6s ease-in-out infinite;
+          transform-origin: center;
+        }
         @property --nano-banana-angle {
           syntax: "<angle>";
           initial-value: 0deg;
@@ -969,62 +1103,69 @@ export default function Home() {
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
           {pendingGenerations.flatMap((job) =>
             Array.from({ length: job.count }).map((_, i) => (
-            <div
-              key={`skeleton-${job.id}-${i}`}
-              className="overflow-hidden rounded-xl bg-[#1c1c1e]"
-            >
               <div
-                className="nano-banana-gallery-skeleton-shimmer w-full"
-                style={{ aspectRatio: ratioToCssAspect(job.aspectRatio) }}
-              />
-            </div>
+                key={`skeleton-${job.id}-${i}`}
+                className="nano-banana-gallery-skeleton-card overflow-hidden rounded-xl bg-[#1c1c1e]"
+              >
+                <div
+                  className="nano-banana-gallery-skeleton-shimmer w-full"
+                  style={{ aspectRatio: ratioToCssAspect(job.aspectRatio) }}
+                />
+              </div>
             )),
           )}
           {images.map((img) => (
             <div
               key={img.id}
-              className="overflow-hidden rounded-xl bg-[#1f1f21]"
+              className="group relative cursor-zoom-in overflow-hidden rounded-xl bg-[#1f1f21]"
+              onClick={() => setSelectedImage(img)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setSelectedImage(img);
+                }
+              }}
             >
-              <div
-                className="group relative cursor-zoom-in"
-                onClick={() => setSelectedImage(img)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setSelectedImage(img);
-                  }
+              <img
+                src={img.public_url}
+                alt={img.prompt}
+                className="block h-auto w-full"
+                loading="lazy"
+              />
+              <button
+                type="button"
+                aria-label="Copy prompt and settings to form"
+                className="absolute right-2 top-2 z-10 inline-flex h-9 w-9 items-center justify-center rounded-full bg-black/60 text-white opacity-0 backdrop-blur-sm transition-all hover:bg-black/75 group-hover:opacity-100"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  void applyGenerationFromGallery(img);
                 }}
-                aria-label="Открыть изображение и детали"
               >
-                <button
-                  type="button"
-                  aria-label="Скопировать промпт, настройки и референсы в форму"
-                  title="Скопировать в форму"
-                  className="absolute right-2 top-2 z-10 inline-flex h-9 w-9 items-center justify-center rounded-full bg-black/60 text-white backdrop-blur-sm transition-colors hover:bg-black/75 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/40"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    void applyGenerationFromGallery(img);
-                  }}
-                >
-                  {copiedGalleryId === img.id ? (
-                    <Check className="h-4 w-4 text-[#c8f135]" aria-hidden />
-                  ) : (
-                    <Copy className="h-4 w-4" aria-hidden />
-                  )}
-                </button>
-                <img
-                  src={img.public_url}
-                  alt={img.prompt}
-                  className="block w-full h-auto"
-                  loading="lazy"
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
-                <div className="absolute left-0 right-0 bottom-0 p-3 opacity-0 transition-opacity group-hover:opacity-100">
-                  <p className="text-sm leading-snug text-white">{img.prompt}</p>
-                </div>
+                {copiedGalleryId === img.id ? (
+                  <Check className="h-4 w-4 text-[#c8f135]" aria-hidden />
+                ) : (
+                  <Copy className="h-4 w-4" aria-hidden />
+                )}
+              </button>
+              <button
+                type="button"
+                aria-label="Скачать изображение"
+                title="Скачать"
+                className="absolute right-12 top-2 z-10 inline-flex h-9 w-9 items-center justify-center rounded-full bg-black/60 text-white opacity-0 backdrop-blur-sm transition-all hover:bg-black/75 group-hover:opacity-100"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  void downloadImage(img);
+                }}
+              >
+                <Download className="h-4 w-4" aria-hidden />
+              </button>
+              <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
+              <div className="pointer-events-none absolute bottom-0 left-0 right-0 p-3 opacity-0 transition-opacity group-hover:opacity-100">
+                <p className="text-sm leading-snug text-white">{img.prompt}</p>
               </div>
             </div>
           ))}
@@ -1164,38 +1305,36 @@ export default function Home() {
 
             <div className="flex items-start justify-between gap-3">
               <div className="flex flex-wrap gap-2">
-                {references.map((ref) => (
-                  <div
-                    key={ref.id}
-                    className="relative h-16 w-16 overflow-hidden rounded-lg bg-white/5"
+                <DndContext
+                  sensors={sensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={handleDragEnd}
+                >
+                  <SortableContext
+                    items={references.map((r) => r.id)}
+                    strategy={horizontalListSortingStrategy}
                   >
-                    <img
-                      src={ref.previewUrl}
-                      alt="Reference image"
-                      className="h-full w-full object-cover"
-                    />
-                    <button
-                      type="button"
-                      aria-label="Remove reference image"
-                      className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white hover:bg-black/70 disabled:cursor-not-allowed disabled:opacity-60"
-                      onClick={() => removeReference(ref.id)}
-                    >
-                      <XIcon size={14} />
-                    </button>
-                  </div>
-                ))}
-
-                {references.length < 4 ? (
-                  <button
-                    type="button"
-                    aria-label="Add reference images"
-                    className="flex h-16 w-16 items-center justify-center rounded-lg border border-dashed border-white/30 bg-transparent text-white/90 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-60"
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    <span className="text-3xl leading-none">+</span>
-                  </button>
-                ) : null}
-
+                    <div className="flex flex-wrap gap-2">
+                      {references.map((refImg) => (
+                        <SortableReferenceThumb
+                          key={refImg.id}
+                          refImage={refImg}
+                          onRemove={removeReference}
+                        />
+                      ))}
+                      {references.length < 4 ? (
+                        <button
+                          type="button"
+                          aria-label="Add reference images"
+                          className="flex h-16 w-16 items-center justify-center rounded-lg border border-dashed border-white/30 bg-transparent text-white/90 hover:bg-white/5"
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          <span className="text-3xl leading-none">+</span>
+                        </button>
+                      ) : null}
+                    </div>
+                  </SortableContext>
+                </DndContext>
                 <input
                   ref={fileInputRef}
                   type="file"

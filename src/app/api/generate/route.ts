@@ -22,11 +22,11 @@ const MODEL_ID = "gemini-3-pro-image-preview";
 const PRICING_VERSION = "2026-03-20-v1";
 const CURRENCY = "USD";
 
-const qualityToResolution: Record<string, number> = {
-  "1K": 1024,
-  "2K": 2048,
-  "4K": 4096,
-};
+const qualityToImageSize = {
+  "1K": "1K",
+  "2K": "2K",
+  "4K": "4K",
+} as const;
 
 const qualityBaseCostUsd: Record<string, number> = {
   "1K": 0.02,
@@ -55,6 +55,14 @@ function clampCount(value: unknown): number {
   return Math.min(4, Math.max(1, Math.floor(n)));
 }
 
+function normalizeQuality(value: unknown): keyof typeof qualityToImageSize {
+  if (typeof value !== "string") return "1K";
+  const trimmed = value.trim().toUpperCase();
+  if (trimmed === "2K") return "2K";
+  if (trimmed === "4K") return "4K";
+  return "1K";
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as {
@@ -67,7 +75,7 @@ export async function POST(req: Request) {
 
     const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
     const aspectRatio = safeString(body?.aspectRatio, "1:1");
-    const quality = safeString(body?.quality, "1K");
+    const quality = normalizeQuality(body?.quality);
     const count = clampCount(body?.count);
     const referenceImages = Array.isArray(body?.referenceImages)
       ? (body.referenceImages as unknown[]).filter(
@@ -86,8 +94,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const resolutionPixels = qualityToResolution[quality] ?? 1024;
-    const finalPrompt = `${prompt}. Aspect ratio: ${aspectRatio}. Image resolution: ${resolutionPixels} pixels on the longest side.`;
+    const imageSize = qualityToImageSize[quality];
     const estimatedCostUsd = estimateCostUsdPerImage(
       quality,
       referenceImages.length,
@@ -107,7 +114,7 @@ export async function POST(req: Request) {
       inlineData: { mimeType: ref.mimeType, data: ref.data.replace(/\s/g, "") },
     }));
 
-    const textPart = { text: finalPrompt };
+    const textPart = { text: prompt };
     const userContent = { role: "user", parts: [...imageParts, textPart] };
 
     const results = await Promise.all(
@@ -115,7 +122,13 @@ export async function POST(req: Request) {
         const response = await genAI.models.generateContent({
           model: MODEL_ID,
           contents: [userContent],
-          config: { responseModalities: ["IMAGE", "TEXT"] },
+          config: {
+            responseModalities: ["IMAGE", "TEXT"],
+            imageConfig: {
+              aspectRatio,
+              imageSize,
+            },
+          },
         });
 
         const parts = response.candidates?.[0]?.content?.parts ?? [];
