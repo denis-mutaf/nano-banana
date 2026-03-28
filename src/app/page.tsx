@@ -209,6 +209,15 @@ function sortImagesNewestFirst(items: GeneratedImage[]): GeneratedImage[] {
   });
 }
 
+function deduplicateImages(items: GeneratedImage[]): GeneratedImage[] {
+  const seen = new Set<string>();
+  return items.filter((img) => {
+    if (seen.has(img.id)) return false;
+    seen.add(img.id);
+    return true;
+  });
+}
+
 function getDownloadFileName(img: GeneratedImage): string {
   const source = img.public_url.trim();
   const fromUrl = (() => {
@@ -490,6 +499,10 @@ export default function Home() {
   const [copiedGalleryId, setCopiedGalleryId] = useState<string | null>(null);
   const [selectedImage, setSelectedImage] = useState<GeneratedImage | null>(null);
   const [islandDraftHydrated, setIslandDraftHydrated] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loadingMoreRef = useRef(false);
+  const galleryEndRef = useRef<HTMLDivElement | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
@@ -616,120 +629,166 @@ export default function Home() {
     }
   }, [islandDraftHydrated, prompt, aspectRatio, quality, count, references]);
 
+  const authHeaders = {
+    apikey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!}`,
+  };
+
+  const parseRows = (
+    data: unknown,
+    hasExtendedFields: boolean,
+    localMeta: Record<string, LocalGenerationMeta>,
+  ): GeneratedImage[] =>
+    (
+      data as Array<{
+        id: string | number;
+        prompt: string | null;
+        public_url: string | null;
+        created_at?: string | null;
+        aspect_ratio?: string | null;
+        quality?: string | null;
+        requested_count?: number | null;
+        reference_images?: unknown;
+        estimated_cost_usd?: number | null;
+        currency?: string | null;
+        model?: string | null;
+        pricing_version?: string | null;
+      }> | null
+    )?.map((row) => {
+      const id = String(row.id);
+      const publicUrl = row.public_url ?? "";
+      const byId = localMeta[`id:${id}`];
+      const byUrl = publicUrl ? localMeta[`url:${publicUrl}`] : undefined;
+      const fallbackMeta = byId ?? byUrl;
+
+      const dbReferences = hasExtendedFields
+        ? parseReferenceImagesColumn(row.reference_images)
+        : [];
+
+      return {
+        id,
+        prompt: row.prompt ?? "",
+        public_url: publicUrl,
+        created_at: typeof row.created_at === "string" ? row.created_at : null,
+        aspect_ratio:
+          (hasExtendedFields ? (row.aspect_ratio ?? null) : null) ??
+          fallbackMeta?.aspect_ratio ??
+          null,
+        quality:
+          (hasExtendedFields ? (row.quality ?? null) : null) ??
+          fallbackMeta?.quality ??
+          null,
+        requested_count:
+          (hasExtendedFields &&
+          typeof row.requested_count === "number" &&
+          Number.isInteger(row.requested_count)
+            ? row.requested_count
+            : null) ??
+          fallbackMeta?.requested_count ??
+          null,
+        reference_images:
+          dbReferences.length > 0 ? dbReferences : (fallbackMeta?.reference_images ?? []),
+        estimated_cost_usd:
+          hasExtendedFields &&
+          typeof row.estimated_cost_usd === "number" &&
+          Number.isFinite(row.estimated_cost_usd)
+            ? row.estimated_cost_usd
+            : null,
+        currency: hasExtendedFields ? (row.currency ?? "USD") : null,
+        model: hasExtendedFields ? (row.model ?? null) : null,
+        pricing_version: hasExtendedFields ? (row.pricing_version ?? null) : null,
+      };
+    }) ?? [];
+
+  const loadPage = async ({ before }: { before?: string }) => {
+    const baseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    if (!baseUrl) return [] as GeneratedImage[];
+
+    const extendedSelect =
+      "id,prompt,public_url,created_at,aspect_ratio,quality,requested_count,estimated_cost_usd,currency,model,pricing_version";
+    const baseSelect = "id,prompt,public_url,created_at";
+    const localMeta = readLocalGenerationMeta();
+
+    const cursor = before ? `&created_at=lt.${encodeURIComponent(before)}` : "";
+    const queryTail = `${cursor}&order=created_at.desc&limit=${GALLERY_PAGE_SIZE}`;
+
+    const extendedRes = await fetch(
+      `${baseUrl}/rest/v1/generated_images?select=${extendedSelect}${queryTail}`,
+      { headers: authHeaders },
+    );
+
+    if (extendedRes.ok) {
+      const data = await extendedRes.json();
+      const rows = parseRows(data, true, localMeta).filter((r) => r.public_url);
+      if (rows.length < GALLERY_PAGE_SIZE) setHasMore(false);
+      return rows;
+    }
+
+    const fallbackRes = await fetch(
+      `${baseUrl}/rest/v1/generated_images?select=${baseSelect}${queryTail}`,
+      { headers: authHeaders },
+    );
+
+    if (!fallbackRes.ok) return [] as GeneratedImage[];
+    const data = await fallbackRes.json();
+    const rows = parseRows(data, false, localMeta).filter((r) => r.public_url);
+    if (rows.length < GALLERY_PAGE_SIZE) setHasMore(false);
+    return rows;
+  };
+
   useEffect(() => {
     let cancelled = false;
-
-    const authHeaders = {
-      apikey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!}`,
-    };
-
-    const parseRows = (
-      data: unknown,
-      hasExtendedFields: boolean,
-      localMeta: Record<string, LocalGenerationMeta>,
-    ): GeneratedImage[] =>
-      (
-        data as Array<{
-          id: string | number;
-          prompt: string | null;
-          public_url: string | null;
-          created_at?: string | null;
-          aspect_ratio?: string | null;
-          quality?: string | null;
-          requested_count?: number | null;
-          reference_images?: unknown;
-          estimated_cost_usd?: number | null;
-          currency?: string | null;
-          model?: string | null;
-          pricing_version?: string | null;
-        }> | null
-      )?.map((row) => {
-        const id = String(row.id);
-        const publicUrl = row.public_url ?? "";
-        const byId = localMeta[`id:${id}`];
-        const byUrl = publicUrl ? localMeta[`url:${publicUrl}`] : undefined;
-        const fallbackMeta = byId ?? byUrl;
-
-        const dbReferences = hasExtendedFields
-          ? parseReferenceImagesColumn(row.reference_images)
-          : [];
-
-        return {
-          id,
-          prompt: row.prompt ?? "",
-          public_url: publicUrl,
-          created_at:
-            typeof row.created_at === "string" ? row.created_at : null,
-          aspect_ratio:
-            (hasExtendedFields ? (row.aspect_ratio ?? null) : null) ??
-            fallbackMeta?.aspect_ratio ??
-            null,
-          quality:
-            (hasExtendedFields ? (row.quality ?? null) : null) ??
-            fallbackMeta?.quality ??
-            null,
-          requested_count:
-            (hasExtendedFields &&
-            typeof row.requested_count === "number" &&
-            Number.isInteger(row.requested_count)
-              ? row.requested_count
-              : null) ??
-            fallbackMeta?.requested_count ??
-            null,
-          reference_images:
-            dbReferences.length > 0
-              ? dbReferences
-              : (fallbackMeta?.reference_images ?? []),
-          estimated_cost_usd:
-            hasExtendedFields &&
-            typeof row.estimated_cost_usd === "number" &&
-            Number.isFinite(row.estimated_cost_usd)
-              ? row.estimated_cost_usd
-              : null,
-          currency: hasExtendedFields ? (row.currency ?? "USD") : null,
-          model: hasExtendedFields ? (row.model ?? null) : null,
-          pricing_version: hasExtendedFields ? (row.pricing_version ?? null) : null,
-        };
-      }) ?? [];
-
-    const load = async () => {
-      const extendedSelect =
-        "id,prompt,public_url,created_at,aspect_ratio,quality,requested_count,estimated_cost_usd,currency,model,pricing_version";
-      const baseSelect = "id,prompt,public_url,created_at";
-
-      const localMeta = readLocalGenerationMeta();
-
-      const extendedRes = await fetch(
-        `${process.env.NEXT_PUBLIC_SUPABASE_URL}/rest/v1/generated_images?select=${extendedSelect}&order=created_at.desc&limit=${GALLERY_PAGE_SIZE}`,
-        { headers: authHeaders },
-      );
-
-      if (extendedRes.ok) {
-        const data = await extendedRes.json();
-        if (cancelled) return;
-        const rows = parseRows(data, true, localMeta);
-        setImages(sortImagesNewestFirst(rows.filter((r) => r.public_url)));
-        return;
-      }
-
-      const fallbackRes = await fetch(
-        `${process.env.NEXT_PUBLIC_SUPABASE_URL}/rest/v1/generated_images?select=${baseSelect}&order=created_at.desc&limit=${GALLERY_PAGE_SIZE}`,
-        { headers: authHeaders },
-      );
-
-      if (!fallbackRes.ok) return;
-      const data = await fallbackRes.json();
+    setHasMore(true);
+    (async () => {
+      const rows = await loadPage({});
       if (cancelled) return;
-      const rows = parseRows(data, false, localMeta);
-      setImages(sortImagesNewestFirst(rows.filter((r) => r.public_url)));
-    };
-
-    load();
+      setImages(deduplicateImages(sortImagesNewestFirst(rows)));
+    })();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    const el = galleryEndRef.current;
+    if (!el || !hasMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries[0]?.isIntersecting) return;
+        if (loadingMoreRef.current) return;
+
+        setImages((currentImages) => {
+          if (currentImages.length === 0) return currentImages;
+
+          const lastCreatedAt = currentImages[currentImages.length - 1]?.created_at;
+          if (!lastCreatedAt) return currentImages;
+
+          if (loadingMoreRef.current) return currentImages;
+          loadingMoreRef.current = true;
+          setLoadingMore(true);
+
+          void loadPage({ before: lastCreatedAt })
+            .then((newRows) => {
+              if (newRows.length === 0) return;
+              setImages((prev) =>
+                deduplicateImages(sortImagesNewestFirst([...prev, ...newRows])),
+              );
+            })
+            .finally(() => {
+              loadingMoreRef.current = false;
+              setLoadingMore(false);
+            });
+
+          return currentImages;
+        });
+      },
+      { rootMargin: "200px" },
+    );
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore]);
 
   const addReferenceFiles = async (files: File[]) => {
     const imageFiles = files.filter((f) => f.type.startsWith("image/"));
@@ -874,7 +933,9 @@ export default function Home() {
       }
       writeLocalGenerationMeta(localMeta);
 
-      setImages((prev) => sortImagesNewestFirst([...created, ...prev]));
+      setImages((prev) =>
+        deduplicateImages(sortImagesNewestFirst([...created, ...prev])),
+      );
 
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -1170,6 +1231,12 @@ export default function Home() {
             </div>
           ))}
         </div>
+        <div ref={galleryEndRef} className="h-1" />
+        {loadingMore ? (
+          <div className="flex justify-center py-4">
+            <Spinner />
+          </div>
+        ) : null}
       </div>
 
       <AnimatePresence>
